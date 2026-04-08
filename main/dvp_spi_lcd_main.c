@@ -1,326 +1,188 @@
+#include <assert.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/lock.h>
 
-#include "driver/gpio.h"
-#include "driver/i2c_master.h"
+#include "driver/ledc.h"
 #include "driver/spi_master.h"
-#include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_st7789.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
-
-#include "esp_lvgl_port.h"
 #include "lvgl.h"
+#include "sdkconfig.h"
 
 #include "example_config.h"
 
-#define APP_PI                          3.14159265358979323846f
-#define APP_TAU                         (2.0f * APP_PI)
-#define APP_FRAME_INTERVAL_MS           50
-#define APP_LONG_PRESS_MS               700
-#define APP_DEBOUNCE_MS                 30
+#define APP_PI                           3.14159265358979323846f
+#define APP_LVGL_DRAW_BUF_LINES          24
+#define APP_LVGL_TICK_PERIOD_MS          2
+#define APP_LVGL_TASK_STACK_SIZE         (4 * 1024)
+#define APP_LVGL_TASK_PRIORITY           1
+#define APP_LVGL_TASK_MAX_DELAY_MS       500
+#define APP_LVGL_TASK_MIN_DELAY_MS       (1000 / CONFIG_FREERTOS_HZ)
 
-#define GRID_W                          32
-#define GRID_H                          32
-#define GRID_SIZE                       (GRID_W * GRID_H)
-#define PARTICLE_COUNT                  144
-#define FLIP_BLEND                      0.90f
-#define PARTICLE_RADIUS_PX              3
-#define PRESSURE_ITERATIONS             10
+#define APP_DIAL_SIZE                    204
+#define APP_DIAL_RADIUS                  (APP_DIAL_SIZE / 2)
+#define APP_TICK_COUNT                   12
+#define APP_LCD_BACKLIGHT_TIMER          LEDC_TIMER_1
+#define APP_LCD_BACKLIGHT_CHANNEL        LEDC_CHANNEL_0
+#define APP_LCD_BACKLIGHT_FREQ_HZ        5000
+#define APP_LCD_BACKLIGHT_DUTY_MAX       1023
+#define APP_HAND_ANIM_MS                 180
 
-typedef enum {
-    APP_MODE_DIAL = 0,
-    APP_MODE_FLUID,
-} app_mode_t;
-
-typedef enum {
-    IMU_TYPE_NONE = 0,
-    IMU_TYPE_MPU6050,
-} imu_type_t;
+#define APP_SIM_START_HOUR               10
+#define APP_SIM_START_MINUTE             8
+#define APP_SIM_START_SECOND             36
 
 typedef struct {
-    uint16_t bg;
-    uint16_t bezel;
-    uint16_t primary;
-    uint16_t secondary;
-    uint16_t accent;
-    uint16_t fluid_bg;
-} ui_theme_t;
+    bool use_system_time;
+    int64_t boot_us;
+    uint32_t base_seconds;
+} clock_model_t;
 
 typedef struct {
-    bool last_pressed;
-    bool long_handled;
-    int64_t pressed_at_us;
-} button_state_t;
-
-typedef struct {
-    float x;
-    float y;
-    float vx;
-    float vy;
-} particle_t;
-
-typedef struct {
-    particle_t particles[PARTICLE_COUNT];
-    float u[GRID_SIZE];
-    float v[GRID_SIZE];
-    float u_prev[GRID_SIZE];
-    float v_prev[GRID_SIZE];
-    float mass[GRID_SIZE];
-    float divergence[GRID_SIZE];
-    float pressure[GRID_SIZE];
-    float pressure_tmp[GRID_SIZE];
-    uint8_t preset;
-} fluid_state_t;
-
-typedef struct {
-    bool available;
-    imu_type_t type;
-    i2c_master_bus_handle_t bus;
-    i2c_master_dev_handle_t dev;
-} motion_input_t;
+    lv_obj_t *line;
+    lv_obj_t *counterweight;
+    lv_point_precise_t points[2];
+    int32_t current_rotation;
+    int32_t head_len;
+    int32_t tail_len;
+    int32_t counterweight_size;
+} hand_widget_t;
 
 typedef struct {
     esp_lcd_panel_handle_t panel;
-    uint16_t *framebuf;
-    app_mode_t mode;
-    uint8_t theme_index;
-    float tilt_x;
-    float tilt_y;
-    float fallback_phase;
-    int64_t start_time_us;
-    button_state_t button;
-    motion_input_t motion;
-    fluid_state_t fluid;
+    esp_lcd_panel_io_handle_t io;
+    lv_display_t *display;
+    lv_obj_t *face;
+    lv_obj_t *info_label;
+    lv_obj_t *ticks[APP_TICK_COUNT];
+    lv_point_precise_t tick_points[APP_TICK_COUNT][2];
+    lv_obj_t *numerals[4];
+    hand_widget_t hour_hand;
+    hand_widget_t minute_hand;
+    hand_widget_t second_hand;
+    lv_obj_t *center_outer;
+    lv_obj_t *center_inner;
+    lv_timer_t *clock_timer;
+    clock_model_t clock;
 } app_state_t;
 
-static const char *TAG = "eye_hci";
+static const char *TAG = "eye_clock";
+static _lock_t s_lvgl_lock;
 static app_state_t s_app;
 
-static const ui_theme_t s_themes[] = {
-    {.bg = 0x0000, .bezel = 0x18E3, .primary = 0xFFFF, .secondary = 0x00FF, .accent = 0xF800, .fluid_bg = 0x0000}, // 赛博朋克青色主题
-    {.bg = 0x0000, .bezel = 0x18E3, .primary = 0xFFFF, .secondary = 0xF800, .accent = 0x00FF, .fluid_bg = 0x0000}, // 赛博朋克洋红色主题
-    {.bg = 0x0000, .bezel = 0x18E3, .primary = 0xFFFF, .secondary = 0x7FFF, .accent = 0xF81F, .fluid_bg = 0x0000}, // 赛博朋克蓝紫色主题
-};
-
-static inline int clampi(int value, int min_v, int max_v)
+static inline int32_t normalize_rotation_tenths(int32_t value)
 {
-    if (value < min_v) {
-        return min_v;
+    int32_t normalized = value % 3600;
+    if (normalized < 0) {
+        normalized += 3600;
     }
-    if (value > max_v) {
-        return max_v;
-    }
-    return value;
+    return normalized;
 }
 
-static inline float clampf(float value, float min_v, float max_v)
+static inline int32_t forward_rotation_delta(int32_t current, int32_t target)
 {
-    if (value < min_v) {
-        return min_v;
-    }
-    if (value > max_v) {
-        return max_v;
-    }
-    return value;
+    return normalize_rotation_tenths(target - current);
 }
 
-static inline float lerpf(float a, float b, float t)
+static void lcd_backlight_init(void)
 {
-    return a + (b - a) * t;
-}
-
-static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
-{
-    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-}
-
-static inline int grid_index(int x, int y)
-{
-    return y * GRID_W + x;
-}
-
-static inline const ui_theme_t *current_theme(const app_state_t *app)
-{
-    return &s_themes[app->theme_index % (sizeof(s_themes) / sizeof(s_themes[0]))];
-}
-
-static inline float particle_to_grid_x(float nx)
-{
-    return clampf(nx * (GRID_W - 3) + 1.0f, 0.0f, (float)GRID_W - 1.001f);
-}
-
-static inline float particle_to_grid_y(float ny)
-{
-    return clampf(ny * (GRID_H - 3) + 1.0f, 0.0f, (float)GRID_H - 1.001f);
-}
-
-static void put_pixel(uint16_t *fb, int x, int y, uint16_t color)
-{
-    if (x < 0 || x >= APP_LCD_H_RES || y < 0 || y >= APP_LCD_V_RES) {
-        return;
-    }
-    fb[y * APP_LCD_H_RES + x] = color;
-}
-
-static void clear_frame(uint16_t *fb, uint16_t color)
-{
-    for (int i = 0; i < APP_LCD_H_RES * APP_LCD_V_RES; i++) {
-        fb[i] = color;
-    }
-}
-
-static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
-{
-    int x0 = clampi(x, 0, APP_LCD_H_RES);
-    int y0 = clampi(y, 0, APP_LCD_V_RES);
-    int x1 = clampi(x + w, 0, APP_LCD_H_RES);
-    int y1 = clampi(y + h, 0, APP_LCD_V_RES);
-
-    for (int py = y0; py < y1; py++) {
-        uint16_t *row = fb + py * APP_LCD_H_RES;
-        for (int px = x0; px < x1; px++) {
-            row[px] = color;
-        }
-    }
-}
-
-static void draw_line(uint16_t *fb, int x0, int y0, int x1, int y1, uint16_t color)
-{
-    int dx = abs(x1 - x0);
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0);
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-
-    while (true) {
-        put_pixel(fb, x0, y0, color);
-        if (x0 == x1 && y0 == y1) {
-            break;
-        }
-        int e2 = err << 1;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-static void draw_circle(uint16_t *fb, int cx, int cy, int radius, uint16_t color)
-{
-    int x = radius;
-    int y = 0;
-    int err = 1 - x;
-
-    while (x >= y) {
-        put_pixel(fb, cx + x, cy + y, color);
-        put_pixel(fb, cx + y, cy + x, color);
-        put_pixel(fb, cx - y, cy + x, color);
-        put_pixel(fb, cx - x, cy + y, color);
-        put_pixel(fb, cx - x, cy - y, color);
-        put_pixel(fb, cx - y, cy - x, color);
-        put_pixel(fb, cx + y, cy - x, color);
-        put_pixel(fb, cx + x, cy - y, color);
-        y++;
-        if (err < 0) {
-            err += 2 * y + 1;
-        } else {
-            x--;
-            err += 2 * (y - x) + 1;
-        }
-    }
-}
-
-static void fill_circle(uint16_t *fb, int cx, int cy, int radius, uint16_t color)
-{
-    int rr = radius * radius;
-    for (int y = -radius; y <= radius; y++) {
-        int yy = y * y;
-        for (int x = -radius; x <= radius; x++) {
-            if ((x * x + yy) <= rr) {
-                put_pixel(fb, cx + x, cy + y, color);
-            }
-        }
-    }
-}
-
-static void draw_ring(uint16_t *fb, int cx, int cy, int radius, int thickness, uint16_t color)
-{
-    for (int i = 0; i < thickness; i++) {
-        draw_circle(fb, cx, cy, radius - i, color);
-    }
-}
-
-static void draw_status_bar(const app_state_t *app)
-{
-    const ui_theme_t *theme = current_theme(app);
-    uint16_t *fb = app->framebuf;
-
-    fill_rect(fb, 8, 8, 52, 10, theme->bezel);
-    fill_rect(fb, 10, 10, app->mode == APP_MODE_DIAL ? 22 : 10, 6, theme->primary);
-    fill_rect(fb, 34, 10, app->mode == APP_MODE_FLUID ? 22 : 10, 6, theme->secondary);
-
-    uint16_t motion_color = app->motion.available ? rgb565(80, 255, 160) : rgb565(255, 180, 40);
-    fill_rect(fb, APP_LCD_H_RES - 22, 10, 12, 12, motion_color);
-    fill_rect(fb, APP_LCD_H_RES - 44, 10, 16, 12, theme->accent);
-    for (int i = 0; i < 3; i++) {
-        int w = 2 + i * 3;
-        fill_rect(fb, APP_LCD_H_RES - 42 + i * 5, 18 - w, 3, w, theme->bg);
-    }
-}
-
-static void draw_hand(uint16_t *fb, int cx, int cy, float angle, int length, uint16_t color)
-{
-    int x1 = cx + (int)(cosf(angle) * length);
-    int y1 = cy + (int)(sinf(angle) * length);
-    draw_line(fb, cx, cy, x1, y1, color);
-    fill_circle(fb, x1, y1, 2, color);
-}
-
-static void lcd_display_init(esp_lcd_panel_handle_t *lcd_panel_hdl)
-{
-    esp_lcd_panel_handle_t panel_handle = NULL;
-    esp_lcd_panel_io_handle_t lcd_io_hdl = NULL;
-
-    const gpio_config_t backlight_cfg = {
-        .pin_bit_mask = 1ULL << EXAMPLE_LCD_BACKLIGHT,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    const ledc_timer_config_t timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = APP_LCD_BACKLIGHT_TIMER,
+        .freq_hz = APP_LCD_BACKLIGHT_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    ESP_ERROR_CHECK(gpio_config(&backlight_cfg));
-    gpio_set_level(EXAMPLE_LCD_BACKLIGHT, 1);
-    printf("L1\n");
-    fflush(stdout);
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
 
-    ESP_LOGI(TAG, "lcd: init spi bus");
+    const ledc_channel_config_t channel_cfg = {
+        .gpio_num = EXAMPLE_LCD_BACKLIGHT,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = APP_LCD_BACKLIGHT_CHANNEL,
+        .timer_sel = APP_LCD_BACKLIGHT_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .duty = 0,
+        .hpoint = 0,
+        .flags.output_invert = true,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
+}
+
+static void lcd_backlight_set_percent(uint8_t percent)
+{
+    if (percent > 100) {
+        percent = 100;
+    }
+    uint32_t duty = (APP_LCD_BACKLIGHT_DUTY_MAX * percent) / 100;
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, APP_LCD_BACKLIGHT_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, APP_LCD_BACKLIGHT_CHANNEL));
+}
+
+static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    LV_UNUSED(panel_io);
+    LV_UNUSED(edata);
+    lv_display_t *display = (lv_display_t *)user_ctx;
+    lv_display_flush_ready(display);
+    return false;
+}
+
+static void lvgl_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *px_map)
+{
+    esp_lcd_panel_handle_t panel = lv_display_get_user_data(display);
+    lv_draw_sw_rgb565_swap(px_map, (area->x2 + 1 - area->x1) * (area->y2 + 1 - area->y1));
+    esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
+}
+
+static void lvgl_tick_cb(void *arg)
+{
+    LV_UNUSED(arg);
+    lv_tick_inc(APP_LVGL_TICK_PERIOD_MS);
+}
+
+static void lvgl_port_task(void *arg)
+{
+    LV_UNUSED(arg);
+    while (true) {
+        _lock_acquire(&s_lvgl_lock);
+        uint32_t delay_ms = lv_timer_handler();
+        _lock_release(&s_lvgl_lock);
+
+        if (delay_ms < APP_LVGL_TASK_MIN_DELAY_MS) {
+            delay_ms = APP_LVGL_TASK_MIN_DELAY_MS;
+        }
+        if (delay_ms > APP_LVGL_TASK_MAX_DELAY_MS) {
+            delay_ms = APP_LVGL_TASK_MAX_DELAY_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+}
+
+static void lcd_display_init(app_state_t *app)
+{
+    lcd_backlight_init();
+    lcd_backlight_set_percent(0);
+
     const spi_bus_config_t bus_cfg = {
         .sclk_io_num = EXAMPLE_LCD_SPI_CLK,
         .mosi_io_num = EXAMPLE_LCD_SPI_MOSI,
         .miso_io_num = GPIO_NUM_NC,
         .quadwp_io_num = GPIO_NUM_NC,
         .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = APP_LCD_H_RES * APP_LCD_V_RES * sizeof(uint16_t),
+        .max_transfer_sz = APP_LCD_H_RES * APP_LVGL_DRAW_BUF_LINES * sizeof(uint16_t),
     };
     ESP_ERROR_CHECK(spi_bus_initialize(EXAMPLE_LCD_SPI_NUM, &bus_cfg, SPI_DMA_CH_AUTO));
-    printf("L2\n");
-    fflush(stdout);
 
-    ESP_LOGI(TAG, "lcd: init panel io");
     const esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num = EXAMPLE_LCD_DC,
         .cs_gpio_num = EXAMPLE_LCD_SPI_CS,
@@ -328,647 +190,357 @@ static void lcd_display_init(esp_lcd_panel_handle_t *lcd_panel_hdl)
         .lcd_cmd_bits = EXAMPLE_LCD_CMD_BITS,
         .lcd_param_bits = EXAMPLE_LCD_PARAM_BITS,
         .spi_mode = 2,
-        .trans_queue_depth = 4,
+        .trans_queue_depth = 10,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_LCD_SPI_NUM, &io_cfg, &lcd_io_hdl));
-    printf("L3\n");
-    fflush(stdout);
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_LCD_SPI_NUM, &io_cfg, &app->io));
 
-    ESP_LOGI(TAG, "lcd: init st7789");
-    const esp_lcd_panel_dev_config_t panel_dev_cfg = {
+    const esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = EXAMPLE_LCD_RST,
-        .color_space = ESP_LCD_COLOR_SPACE_RGB,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = APP_RGB565_BITS_PER_PIXEL,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_hdl, &panel_dev_cfg, &panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 0, 20));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-    printf("L4\n");
-    fflush(stdout);
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(app->io, &panel_cfg, &app->panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(app->panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(app->panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(app->panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(app->panel, true));
 
-    gpio_set_level(EXAMPLE_LCD_BACKLIGHT, 0);
-    ESP_LOGI(TAG, "lcd: backlight on");
-
-    *lcd_panel_hdl = panel_handle;
+    vTaskDelay(pdMS_TO_TICKS(20));
+    lcd_backlight_set_percent(100);
 }
 
-static void button_init(button_state_t *button)
+static void lvgl_init_display(app_state_t *app)
 {
-    const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << EXAMPLE_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    lv_init();
+    app->display = lv_display_create(APP_LCD_H_RES, APP_LCD_V_RES);
+
+    size_t draw_buf_size = APP_LCD_H_RES * APP_LVGL_DRAW_BUF_LINES * sizeof(uint16_t);
+    void *buf1 = spi_bus_dma_memory_alloc(EXAMPLE_LCD_SPI_NUM, draw_buf_size, 0);
+    void *buf2 = spi_bus_dma_memory_alloc(EXAMPLE_LCD_SPI_NUM, draw_buf_size, 0);
+    assert(buf1 && buf2);
+
+    lv_display_set_buffers(app->display, buf1, buf2, draw_buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_user_data(app->display, app->panel);
+    lv_display_set_color_format(app->display, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(app->display, lvgl_flush_cb);
+
+    const esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = notify_lvgl_flush_ready,
     };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-    memset(button, 0, sizeof(*button));
-}
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(app->io, &cbs, app->display));
 
-static esp_err_t motion_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_transmit_receive(dev, &reg, 1, data, len, 50);
-}
-
-static esp_err_t motion_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
-{
-    uint8_t payload[2] = {reg, value};
-    return i2c_master_transmit(dev, payload, sizeof(payload), 50);
-}
-
-static bool motion_probe_mpu6050(motion_input_t *motion, uint16_t address)
-{
-    i2c_device_config_t dev_cfg = {
-        .device_address = address,
-        .scl_speed_hz = 400000,
+    const esp_timer_create_args_t tick_args = {
+        .callback = lvgl_tick_cb,
+        .name = "lvgl_tick",
     };
-    i2c_master_dev_handle_t dev = NULL;
-    if (i2c_master_bus_add_device(motion->bus, &dev_cfg, &dev) != ESP_OK) {
-        return false;
-    }
-
-    uint8_t who_am_i = 0;
-    if (motion_read_reg(dev, 0x75, &who_am_i, 1) != ESP_OK || (who_am_i != 0x68 && who_am_i != 0x70)) {
-        i2c_master_bus_rm_device(dev);
-        return false;
-    }
-
-    ESP_ERROR_CHECK(motion_write_reg(dev, 0x6B, 0x00));
-    ESP_ERROR_CHECK(motion_write_reg(dev, 0x1C, 0x00));
-
-    motion->dev = dev;
-    motion->type = IMU_TYPE_MPU6050;
-    motion->available = true;
-    ESP_LOGI(TAG, "Detected MPU6050 at 0x%02X", address);
-    return true;
+    esp_timer_handle_t tick_timer = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&tick_args, &tick_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, APP_LVGL_TICK_PERIOD_MS * 1000));
 }
 
-static void motion_input_init(motion_input_t *motion)
+static void clock_model_init(clock_model_t *clock)
 {
-    memset(motion, 0, sizeof(*motion));
+    memset(clock, 0, sizeof(*clock));
 
-    i2c_master_bus_config_t bus_cfg = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = EXAMPLE_SENSOR_I2C_SDA_IO,
-        .scl_io_num = EXAMPLE_SENSOR_I2C_SCL_IO,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    if (i2c_new_master_bus(&bus_cfg, &motion->bus) != ESP_OK) {
-        ESP_LOGW(TAG, "I2C init failed, using fallback motion");
-        return;
-    }
-
-    if (motion_probe_mpu6050(motion, 0x68) || motion_probe_mpu6050(motion, 0x69)) {
-        return;
-    }
-
-    ESP_LOGW(TAG, "No accelerometer detected on I2C, using fallback motion");
-}
-
-static bool motion_input_sample(motion_input_t *motion, float *tilt_x, float *tilt_y)
-{
-    if (!motion->available || motion->type != IMU_TYPE_MPU6050) {
-        return false;
-    }
-
-    uint8_t raw[6] = {0};
-    if (motion_read_reg(motion->dev, 0x3B, raw, sizeof(raw)) != ESP_OK) {
-        motion->available = false;
-        ESP_LOGW(TAG, "Accelerometer read failed, fallback enabled");
-        return false;
-    }
-
-    const int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
-    const int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
-
-    *tilt_x = clampf((float)ay / 16384.0f, -1.2f, 1.2f);
-    *tilt_y = clampf(-(float)ax / 16384.0f, -1.2f, 1.2f);
-    return true;
-}
-
-static void motion_update(app_state_t *app, float dt)
-{
-    float tx = 0.0f;
-    float ty = 0.0f;
-
-    if (motion_input_sample(&app->motion, &tx, &ty)) {
-        app->tilt_x = lerpf(app->tilt_x, tx, 0.2f);
-        app->tilt_y = lerpf(app->tilt_y, ty, 0.2f);
-        return;
-    }
-
-    app->fallback_phase += dt;
-    tx = 0.65f * sinf(app->fallback_phase * 0.9f);
-    ty = 0.45f * cosf(app->fallback_phase * 1.3f);
-    app->tilt_x = lerpf(app->tilt_x, tx, 0.06f);
-    app->tilt_y = lerpf(app->tilt_y, ty, 0.06f);
-}
-
-static void fluid_apply_preset(fluid_state_t *fluid, uint8_t preset)
-{
-    fluid->preset = preset % 3;
-    memset(fluid->u, 0, sizeof(fluid->u));
-    memset(fluid->v, 0, sizeof(fluid->v));
-    memset(fluid->u_prev, 0, sizeof(fluid->u_prev));
-    memset(fluid->v_prev, 0, sizeof(fluid->v_prev));
-    memset(fluid->mass, 0, sizeof(fluid->mass));
-    memset(fluid->divergence, 0, sizeof(fluid->divergence));
-    memset(fluid->pressure, 0, sizeof(fluid->pressure));
-    memset(fluid->pressure_tmp, 0, sizeof(fluid->pressure_tmp));
-
-    for (int i = 0; i < PARTICLE_COUNT; i++) {
-        const float t = (float)i / (float)PARTICLE_COUNT;
-        particle_t *p = &fluid->particles[i];
-        if (fluid->preset == 0) {
-            float angle = t * APP_TAU;
-            float radius = 0.16f + 0.10f * ((float)(i % 9) / 8.0f);
-            p->x = 0.5f + cosf(angle) * radius;
-            p->y = 0.58f + sinf(angle) * radius;
-            p->vx = -sinf(angle) * 0.18f;
-            p->vy = cosf(angle) * 0.18f;
-        } else if (fluid->preset == 1) {
-            float side = (i & 1) ? 0.34f : 0.66f;
-            float row = (float)(i / 2) / ((float)PARTICLE_COUNT / 2.0f);
-            p->x = side + 0.08f * sinf(row * APP_TAU * 2.0f);
-            p->y = 0.24f + row * 0.50f;
-            p->vx = (i & 1) ? -0.14f : 0.14f;
-            p->vy = 0.04f * cosf(row * APP_TAU * 3.0f);
-        } else {
-            float angle = t * APP_TAU;
-            float radius = 0.24f;
-            p->x = 0.5f + cosf(angle) * radius;
-            p->y = 0.52f + sinf(angle) * radius * 0.65f;
-            p->vx = cosf(angle) * 0.10f;
-            p->vy = -0.28f * fabsf(sinf(angle));
-        }
-    }
-}
-
-static void fluid_impulse(fluid_state_t *fluid, float gx, float gy)
-{
-    for (int i = 0; i < PARTICLE_COUNT; i++) {
-        particle_t *p = &fluid->particles[i];
-        float dx = p->x - 0.5f;
-        float dy = p->y - 0.5f;
-        float dist = sqrtf(dx * dx + dy * dy) + 0.001f;
-        float gain = clampf(0.24f - dist, 0.0f, 0.24f) * 8.0f;
-        p->vx += gx * gain;
-        p->vy += gy * gain;
-    }
-}
-
-static void fluid_step(fluid_state_t *fluid, float dt, float gravity_x, float gravity_y)
-{
-    memset(fluid->u, 0, sizeof(fluid->u));
-    memset(fluid->v, 0, sizeof(fluid->v));
-    memset(fluid->mass, 0, sizeof(fluid->mass));
-    memset(fluid->pressure, 0, sizeof(fluid->pressure));
-    memset(fluid->pressure_tmp, 0, sizeof(fluid->pressure_tmp));
-
-    for (int i = 0; i < PARTICLE_COUNT; i++) {
-        const particle_t *p = &fluid->particles[i];
-        float gx = particle_to_grid_x(p->x);
-        float gy = particle_to_grid_y(p->y);
-        int x0 = (int)floorf(gx);
-        int y0 = (int)floorf(gy);
-        int x1 = clampi(x0 + 1, 0, GRID_W - 1);
-        int y1 = clampi(y0 + 1, 0, GRID_H - 1);
-        float tx = gx - (float)x0;
-        float ty = gy - (float)y0;
-
-        float w00 = (1.0f - tx) * (1.0f - ty);
-        float w10 = tx * (1.0f - ty);
-        float w01 = (1.0f - tx) * ty;
-        float w11 = tx * ty;
-
-        int i00 = grid_index(x0, y0);
-        int i10 = grid_index(x1, y0);
-        int i01 = grid_index(x0, y1);
-        int i11 = grid_index(x1, y1);
-
-        fluid->mass[i00] += w00;
-        fluid->mass[i10] += w10;
-        fluid->mass[i01] += w01;
-        fluid->mass[i11] += w11;
-
-        fluid->u[i00] += p->vx * w00;
-        fluid->u[i10] += p->vx * w10;
-        fluid->u[i01] += p->vx * w01;
-        fluid->u[i11] += p->vx * w11;
-
-        fluid->v[i00] += p->vy * w00;
-        fluid->v[i10] += p->vy * w10;
-        fluid->v[i01] += p->vy * w01;
-        fluid->v[i11] += p->vy * w11;
-    }
-
-    for (int y = 0; y < GRID_H; y++) {
-        for (int x = 0; x < GRID_W; x++) {
-            int idx = grid_index(x, y);
-            if (fluid->mass[idx] > 0.0001f) {
-                fluid->u[idx] /= fluid->mass[idx];
-                fluid->v[idx] /= fluid->mass[idx];
-            }
-            fluid->u_prev[idx] = fluid->u[idx];
-            fluid->v_prev[idx] = fluid->v[idx];
+    time_t now = time(NULL);
+    struct tm now_tm = {0};
+    if (now > 1704067200 && localtime_r(&now, &now_tm) != NULL) {
+        int year = now_tm.tm_year + 1900;
+        if (year >= 2024 && year < 2100) {
+            clock->use_system_time = true;
+            return;
         }
     }
 
-    for (int y = 1; y < GRID_H - 1; y++) {
-        for (int x = 1; x < GRID_W - 1; x++) {
-            int idx = grid_index(x, y);
-            fluid->u[idx] += gravity_x * dt;
-            fluid->v[idx] += gravity_y * dt;
-        }
-    }
-
-    for (int y = 1; y < GRID_H - 1; y++) {
-        for (int x = 1; x < GRID_W - 1; x++) {
-            int idx = grid_index(x, y);
-            fluid->divergence[idx] = 0.5f * ((fluid->u[grid_index(x + 1, y)] - fluid->u[grid_index(x - 1, y)]) +
-                                             (fluid->v[grid_index(x, y + 1)] - fluid->v[grid_index(x, y - 1)]));
-        }
-    }
-
-    float *pressure_read = fluid->pressure;
-    float *pressure_write = fluid->pressure_tmp;
-    for (int iter = 0; iter < PRESSURE_ITERATIONS; iter++) {
-        for (int y = 1; y < GRID_H - 1; y++) {
-            for (int x = 1; x < GRID_W - 1; x++) {
-                int idx = grid_index(x, y);
-                pressure_write[idx] = (fluid->divergence[idx] + pressure_read[grid_index(x - 1, y)] + pressure_read[grid_index(x + 1, y)] +
-                                       pressure_read[grid_index(x, y - 1)] + pressure_read[grid_index(x, y + 1)]) * 0.25f;
-            }
-        }
-        float *tmp = pressure_read;
-        pressure_read = pressure_write;
-        pressure_write = tmp;
-    }
-    if (pressure_read != fluid->pressure) {
-        memcpy(fluid->pressure, pressure_read, sizeof(fluid->pressure));
-    }
-
-    for (int y = 1; y < GRID_H - 1; y++) {
-        for (int x = 1; x < GRID_W - 1; x++) {
-            int idx = grid_index(x, y);
-            fluid->u[idx] -= 0.5f * (fluid->pressure[grid_index(x + 1, y)] - fluid->pressure[grid_index(x - 1, y)]);
-            fluid->v[idx] -= 0.5f * (fluid->pressure[grid_index(x, y + 1)] - fluid->pressure[grid_index(x, y - 1)]);
-        }
-    }
-
-    for (int x = 0; x < GRID_W; x++) {
-        fluid->u[grid_index(x, 0)] = 0.0f;
-        fluid->u[grid_index(x, GRID_H - 1)] = 0.0f;
-        fluid->v[grid_index(x, 0)] = 0.0f;
-        fluid->v[grid_index(x, GRID_H - 1)] = 0.0f;
-    }
-    for (int y = 0; y < GRID_H; y++) {
-        fluid->u[grid_index(0, y)] = 0.0f;
-        fluid->u[grid_index(GRID_W - 1, y)] = 0.0f;
-        fluid->v[grid_index(0, y)] = 0.0f;
-        fluid->v[grid_index(GRID_W - 1, y)] = 0.0f;
-    }
-
-    for (int i = 0; i < PARTICLE_COUNT; i++) {
-        particle_t *p = &fluid->particles[i];
-        float gx = particle_to_grid_x(p->x);
-        float gy = particle_to_grid_y(p->y);
-        int x0 = (int)floorf(gx);
-        int y0 = (int)floorf(gy);
-        int x1 = clampi(x0 + 1, 0, GRID_W - 1);
-        int y1 = clampi(y0 + 1, 0, GRID_H - 1);
-        float tx = gx - (float)x0;
-        float ty = gy - (float)y0;
-
-        float w00 = (1.0f - tx) * (1.0f - ty);
-        float w10 = tx * (1.0f - ty);
-        float w01 = (1.0f - tx) * ty;
-        float w11 = tx * ty;
-
-        int i00 = grid_index(x0, y0);
-        int i10 = grid_index(x1, y0);
-        int i01 = grid_index(x0, y1);
-        int i11 = grid_index(x1, y1);
-
-        float pic_vx = fluid->u[i00] * w00 + fluid->u[i10] * w10 + fluid->u[i01] * w01 + fluid->u[i11] * w11;
-        float pic_vy = fluid->v[i00] * w00 + fluid->v[i10] * w10 + fluid->v[i01] * w01 + fluid->v[i11] * w11;
-        float delta_vx = (fluid->u[i00] - fluid->u_prev[i00]) * w00 + (fluid->u[i10] - fluid->u_prev[i10]) * w10 +
-                         (fluid->u[i01] - fluid->u_prev[i01]) * w01 + (fluid->u[i11] - fluid->u_prev[i11]) * w11;
-        float delta_vy = (fluid->v[i00] - fluid->v_prev[i00]) * w00 + (fluid->v[i10] - fluid->v_prev[i10]) * w10 +
-                         (fluid->v[i01] - fluid->v_prev[i01]) * w01 + (fluid->v[i11] - fluid->v_prev[i11]) * w11;
-
-        float flip_vx = p->vx + delta_vx;
-        float flip_vy = p->vy + delta_vy;
-
-        p->vx = lerpf(pic_vx, flip_vx, FLIP_BLEND) * 0.995f;
-        p->vy = lerpf(pic_vy, flip_vy, FLIP_BLEND) * 0.995f;
-
-        p->x += p->vx * dt;
-        p->y += p->vy * dt;
-
-        if (p->x < 0.03f) {
-            p->x = 0.03f;
-            p->vx *= -0.35f;
-        } else if (p->x > 0.97f) {
-            p->x = 0.97f;
-            p->vx *= -0.35f;
-        }
-        if (p->y < 0.03f) {
-            p->y = 0.03f;
-            p->vy *= -0.35f;
-        } else if (p->y > 0.97f) {
-            p->y = 0.97f;
-            p->vy *= -0.35f;
-        }
-    }
+    clock->use_system_time = false;
+    clock->boot_us = esp_timer_get_time();
+    clock->base_seconds = APP_SIM_START_HOUR * 3600U + APP_SIM_START_MINUTE * 60U + APP_SIM_START_SECOND;
 }
 
-static void draw_dial(app_state_t *app, float uptime_s)
+static float clock_model_get_seconds_today(const clock_model_t *clock)
 {
-    const ui_theme_t *theme = current_theme(app);
-    uint16_t *fb = app->framebuf;
-    clear_frame(fb, theme->bg);
-
-    const int cx = APP_LCD_H_RES / 2;
-    const int cy = APP_LCD_V_RES / 2;
-    const int outer_r = 106;
-    const int inner_r = 88;
-
-    fill_circle(fb, cx, cy, 112, theme->bezel);
-    fill_circle(fb, cx, cy, 102, theme->bg);
-    draw_ring(fb, cx, cy, outer_r, 3, theme->primary);
-    draw_ring(fb, cx, cy, inner_r, 2, theme->secondary);
-
-    for (int i = 0; i < 60; i++) {
-        float angle = ((float)i / 60.0f) * APP_TAU - APP_PI / 2.0f;
-        int tick_outer = outer_r - 4;
-        int tick_inner = (i % 5 == 0) ? outer_r - 20 : outer_r - 11;
-        uint16_t color = (i % 5 == 0) ? theme->accent : theme->secondary;
-        int x0 = cx + (int)(cosf(angle) * tick_inner);
-        int y0 = cy + (int)(sinf(angle) * tick_inner);
-        int x1 = cx + (int)(cosf(angle) * tick_outer);
-        int y1 = cy + (int)(sinf(angle) * tick_outer);
-        draw_line(fb, x0, y0, x1, y1, color);
-    }
-
-    float tilt_angle = atan2f(app->tilt_y, app->tilt_x + 0.0001f);
-    float tilt_mag = clampf(sqrtf(app->tilt_x * app->tilt_x + app->tilt_y * app->tilt_y), 0.0f, 1.0f);
-    float second_angle = fmodf(uptime_s * 0.80f, 1.0f) * APP_TAU - APP_PI / 2.0f;
-    float minute_angle = fmodf(uptime_s * 0.16f + tilt_mag * 0.08f, 1.0f) * APP_TAU - APP_PI / 2.0f;
-    float hour_angle = fmodf(uptime_s * 0.04f + (float)app->theme_index * 0.12f, 1.0f) * APP_TAU - APP_PI / 2.0f;
-
-    draw_hand(fb, cx, cy, hour_angle, 46, theme->primary);
-    draw_hand(fb, cx, cy, minute_angle, 72, theme->secondary);
-    draw_hand(fb, cx, cy, second_angle, 86, theme->accent);
-
-    int bubble_x = cx + (int)(app->tilt_x * 32.0f);
-    int bubble_y = cy + (int)(app->tilt_y * 32.0f);
-    draw_ring(fb, cx, cy, 34, 1, theme->secondary);
-    fill_circle(fb, bubble_x, bubble_y, 9, theme->accent);
-    draw_line(fb, cx, cy, cx + (int)(cosf(tilt_angle) * 34.0f), cy + (int)(sinf(tilt_angle) * 34.0f), theme->primary);
-    fill_circle(fb, cx, cy, 6, theme->primary);
-
-    for (int i = 0; i < 18; i++) {
-        float angle = ((float)i / 18.0f) * APP_TAU + uptime_s * 0.08f;
-        int radius = 16 + (i % 3) * 6;
-        int px = cx + (int)(cosf(angle) * radius);
-        int py = cy + (int)(sinf(angle) * radius);
-        put_pixel(fb, px, py, theme->secondary);
-    }
-
-    draw_status_bar(app);
-}
-
-static void draw_fluid(app_state_t *app)
-{
-    const ui_theme_t *theme = current_theme(app);
-    uint16_t *fb = app->framebuf;
-    clear_frame(fb, theme->fluid_bg);
-
-    const int cx = APP_LCD_H_RES / 2;
-    const int cy = APP_LCD_V_RES / 2;
-    fill_circle(fb, cx, cy, 112, theme->bezel);
-    fill_circle(fb, cx, cy, 101, theme->fluid_bg);
-    draw_ring(fb, cx, cy, 106, 3, theme->primary);
-    draw_ring(fb, cx, cy, 92, 2, theme->secondary);
-
-    for (int i = 0; i < PARTICLE_COUNT; i++) {
-        const particle_t *p = &app->fluid.particles[i];
-        int sx = 18 + (int)(p->x * 204.0f);
-        int sy = 18 + (int)(p->y * 204.0f);
-        float speed = clampf(sqrtf(p->vx * p->vx + p->vy * p->vy) * 4.0f, 0.0f, 1.0f);
-        uint16_t c0 = speed > 0.72f ? theme->accent : theme->secondary;
-        uint16_t c1 = speed > 0.30f ? theme->primary : theme->secondary;
-        fill_circle(fb, sx, sy, PARTICLE_RADIUS_PX, c1);
-        put_pixel(fb, sx, sy, c0);
-        put_pixel(fb, sx + 1, sy, c0);
-        put_pixel(fb, sx, sy + 1, c0);
-    }
-
-    int gx = cx + (int)(app->tilt_x * 44.0f);
-    int gy = cy + (int)(app->tilt_y * 44.0f);
-    draw_line(fb, cx, cy, gx, gy, theme->accent);
-    fill_circle(fb, gx, gy, 4, theme->accent);
-    fill_circle(fb, cx, cy, 3, theme->primary);
-
-    draw_status_bar(app);
-}
-
-static bool g_fluid_paused = false;
-
-static void app_on_short_press(app_state_t *app)
-{
-    // 切换颜色主题
-    app->theme_index = (app->theme_index + 1) % (sizeof(s_themes) / sizeof(s_themes[0]));
-    ESP_LOGI(TAG, "Color theme -> %u", app->theme_index);
-}
-
-static void app_on_long_press(app_state_t *app)
-{
-    // 暂停/重置流体模拟
-    g_fluid_paused = !g_fluid_paused;
-    if (g_fluid_paused) {
-        ESP_LOGI(TAG, "Fluid simulation paused");
-    } else {
-        // 重置流体
-        fluid_apply_preset(&app->fluid, app->fluid.preset + 1);
-        fluid_impulse(&app->fluid, app->tilt_x * 1.5f, app->tilt_y * 1.5f - 0.4f);
-        ESP_LOGI(TAG, "Fluid simulation reset and resumed");
-    }
-}
-
-static void button_poll(app_state_t *app)
-{
-    button_state_t *button = &app->button;
-    bool pressed = gpio_get_level(EXAMPLE_BUTTON_GPIO) == EXAMPLE_BUTTON_ACTIVE_LEVEL;
-    int64_t now_us = esp_timer_get_time();
-
-    if (pressed && !button->last_pressed) {
-        button->pressed_at_us = now_us;
-        button->long_handled = false;
-    }
-
-    if (pressed && !button->long_handled) {
-        int64_t held_ms = (now_us - button->pressed_at_us) / 1000;
-        if (held_ms >= APP_LONG_PRESS_MS) {
-            app_on_long_press(app);
-            button->long_handled = true;
+    if (clock->use_system_time) {
+        time_t now = time(NULL);
+        struct tm now_tm = {0};
+        if (localtime_r(&now, &now_tm) != NULL) {
+            return (float)(now_tm.tm_hour * 3600 + now_tm.tm_min * 60 + now_tm.tm_sec);
         }
     }
 
-    if (!pressed && button->last_pressed) {
-        int64_t held_ms = (now_us - button->pressed_at_us) / 1000;
-        if (!button->long_handled && held_ms >= APP_DEBOUNCE_MS) {
-            app_on_short_press(app);
-        }
+    double elapsed = (double)(esp_timer_get_time() - clock->boot_us) / 1000000.0;
+    double simulated = fmod((double)clock->base_seconds + elapsed, 86400.0);
+    if (simulated < 0.0) {
+        simulated += 86400.0;
     }
-
-    button->last_pressed = pressed;
+    return (float)simulated;
 }
 
-static lv_obj_t *g_canvas;
-static lv_color_t *g_canvas_buf;
+static void clock_model_get_angles(const clock_model_t *clock, int32_t *hour_tenths, int32_t *minute_tenths, int32_t *second_tenths)
+{
+    float seconds_today = clock_model_get_seconds_today(clock);
+    float seconds = fmodf(seconds_today, 60.0f);
+    float minutes = fmodf(seconds_today / 60.0f, 60.0f);
+    float hours = fmodf(seconds_today / 3600.0f, 12.0f);
+
+    *second_tenths = (int32_t)lroundf(seconds * 60.0f);
+    *minute_tenths = (int32_t)lroundf(minutes * 60.0f);
+    *hour_tenths = (int32_t)lroundf(hours * 300.0f);
+}
+
+static void clock_model_format(const clock_model_t *clock, char *buf, size_t buf_len)
+{
+    float seconds_today = clock_model_get_seconds_today(clock);
+    int total_seconds = (int)seconds_today;
+    int hours = (total_seconds / 3600) % 24;
+    int minutes = (total_seconds / 60) % 60;
+    int seconds = total_seconds % 60;
+
+    snprintf(buf, buf_len, "%s  %02d:%02d:%02d", clock->use_system_time ? "SYS" : "SIM", hours, minutes, seconds);
+}
+
+static void create_tick(app_state_t *app, lv_obj_t *parent, uint32_t index)
+{
+    const bool major = (index % 3U) == 0U;
+    const float angle = ((float)index * 30.0f - 90.0f) * (APP_PI / 180.0f);
+    const float outer_radius = 92.0f;
+    const float inner_radius = major ? 70.0f : 80.0f;
+
+    app->tick_points[index][0].x = APP_DIAL_RADIUS + cosf(angle) * inner_radius;
+    app->tick_points[index][0].y = APP_DIAL_RADIUS + sinf(angle) * inner_radius;
+    app->tick_points[index][1].x = APP_DIAL_RADIUS + cosf(angle) * outer_radius;
+    app->tick_points[index][1].y = APP_DIAL_RADIUS + sinf(angle) * outer_radius;
+
+    lv_obj_t *line = lv_line_create(parent);
+    app->ticks[index] = line;
+    lv_obj_set_size(line, APP_DIAL_SIZE, APP_DIAL_SIZE);
+    lv_obj_set_pos(line, 0, 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(line, 0, 0);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_set_style_line_width(line, major ? 4 : 2, 0);
+    lv_obj_set_style_line_color(line, lv_color_hex(major ? 0xD4D8DE : 0x4F545C), 0);
+    lv_obj_set_style_line_opa(line, major ? LV_OPA_90 : LV_OPA_70, 0);
+    lv_obj_set_style_line_rounded(line, true, 0);
+    lv_line_set_points(line, app->tick_points[index], 2);
+}
+
+static void create_numeral(lv_obj_t *parent, lv_obj_t **label, const char *text, float angle_deg, int x_adjust, int y_adjust)
+{
+    const float angle = (angle_deg - 90.0f) * (APP_PI / 180.0f);
+    const int radius = 54;
+    const int x = APP_DIAL_RADIUS + (int)lroundf(cosf(angle) * radius) + x_adjust;
+    const int y = APP_DIAL_RADIUS + (int)lroundf(sinf(angle) * radius) + y_adjust;
+
+    *label = lv_label_create(parent);
+    lv_label_set_text(*label, text);
+    lv_obj_set_style_text_color(*label, lv_color_hex(0xF2F4F7), 0);
+    lv_obj_set_style_text_opa(*label, LV_OPA_90, 0);
+    lv_obj_set_style_text_letter_space(*label, 1, 0);
+    lv_obj_set_pos(*label, x, y);
+}
+
+static void hand_rotation_exec_cb(void *var, int32_t value)
+{
+    hand_widget_t *hand = (hand_widget_t *)var;
+    int32_t rotation = normalize_rotation_tenths(value);
+    float angle = ((float)rotation / 10.0f - 90.0f) * (APP_PI / 180.0f);
+    float dir_x = cosf(angle);
+    float dir_y = sinf(angle);
+
+    hand->points[0].x = APP_DIAL_RADIUS - dir_x * hand->tail_len;
+    hand->points[0].y = APP_DIAL_RADIUS - dir_y * hand->tail_len;
+    hand->points[1].x = APP_DIAL_RADIUS + dir_x * hand->head_len;
+    hand->points[1].y = APP_DIAL_RADIUS + dir_y * hand->head_len;
+    hand->current_rotation = rotation;
+
+    lv_obj_invalidate(hand->line);
+    if (hand->counterweight != NULL) {
+        lv_obj_set_pos(hand->counterweight,
+                       (int)lroundf(APP_DIAL_RADIUS - dir_x * hand->tail_len) - hand->counterweight_size / 2,
+                       (int)lroundf(APP_DIAL_RADIUS - dir_y * hand->tail_len) - hand->counterweight_size / 2);
+    }
+}
+
+static void hand_widget_create(hand_widget_t *hand, lv_obj_t *parent, int32_t head_len, int32_t tail_len,
+                               int32_t line_width, lv_color_t color, uint8_t opacity, int32_t counterweight_size)
+{
+    memset(hand, 0, sizeof(*hand));
+    hand->head_len = head_len;
+    hand->tail_len = tail_len;
+    hand->counterweight_size = counterweight_size;
+
+    hand->line = lv_line_create(parent);
+    lv_obj_set_size(hand->line, APP_DIAL_SIZE, APP_DIAL_SIZE);
+    lv_obj_set_pos(hand->line, 0, 0);
+    lv_obj_set_style_bg_opa(hand->line, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(hand->line, 0, 0);
+    lv_obj_set_style_pad_all(hand->line, 0, 0);
+    lv_obj_set_style_line_width(hand->line, line_width, 0);
+    lv_obj_set_style_line_color(hand->line, color, 0);
+    lv_obj_set_style_line_opa(hand->line, opacity, 0);
+    lv_obj_set_style_line_rounded(hand->line, true, 0);
+    lv_line_set_points_mutable(hand->line, hand->points, 2);
+
+    if (counterweight_size > 0) {
+        hand->counterweight = lv_obj_create(parent);
+        lv_obj_set_size(hand->counterweight, counterweight_size, counterweight_size);
+        lv_obj_set_style_radius(hand->counterweight, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(hand->counterweight, color, 0);
+        lv_obj_set_style_bg_opa(hand->counterweight, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(hand->counterweight, 0, 0);
+        lv_obj_set_style_outline_width(hand->counterweight, 1, 0);
+        lv_obj_set_style_outline_color(hand->counterweight, lv_color_hex(0x2A0A08), 0);
+        lv_obj_set_style_outline_opa(hand->counterweight, LV_OPA_60, 0);
+    }
+}
+
+static void clock_apply_hand_pose(hand_widget_t *hand, int32_t target)
+{
+    lv_anim_delete(hand, hand_rotation_exec_cb);
+    hand_rotation_exec_cb(hand, target);
+}
+
+static void clock_animate_hand(hand_widget_t *hand, int32_t target, uint32_t duration_ms)
+{
+    int32_t normalized_target = normalize_rotation_tenths(target);
+    int32_t delta = forward_rotation_delta(hand->current_rotation, normalized_target);
+    int32_t start_value = hand->current_rotation;
+    int32_t end_value = hand->current_rotation + delta;
+
+    lv_anim_delete(hand, hand_rotation_exec_cb);
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, hand);
+    lv_anim_set_exec_cb(&anim, hand_rotation_exec_cb);
+    lv_anim_set_values(&anim, start_value, end_value);
+    lv_anim_set_duration(&anim, duration_ms);
+    lv_anim_set_path_cb(&anim, lv_anim_path_linear);
+    lv_anim_set_early_apply(&anim, true);
+    lv_anim_start(&anim);
+
+    hand->current_rotation = normalized_target;
+}
+
+static void clock_update_info_label(app_state_t *app)
+{
+    char text[32];
+    clock_model_format(&app->clock, text, sizeof(text));
+    lv_label_set_text(app->info_label, text);
+}
+
+static void clock_tick_timer_cb(lv_timer_t *timer)
+{
+    app_state_t *app = (app_state_t *)lv_timer_get_user_data(timer);
+    int32_t hour_angle = 0;
+    int32_t minute_angle = 0;
+    int32_t second_angle = 0;
+    clock_model_get_angles(&app->clock, &hour_angle, &minute_angle, &second_angle);
+
+    clock_animate_hand(&app->hour_hand, hour_angle, APP_HAND_ANIM_MS);
+    clock_animate_hand(&app->minute_hand, minute_angle, APP_HAND_ANIM_MS);
+    clock_animate_hand(&app->second_hand, second_angle, APP_HAND_ANIM_MS);
+    clock_update_info_label(app);
+}
+
+static void clock_start(app_state_t *app)
+{
+    int32_t hour_angle = 0;
+    int32_t minute_angle = 0;
+    int32_t second_angle = 0;
+    clock_model_get_angles(&app->clock, &hour_angle, &minute_angle, &second_angle);
+
+    clock_apply_hand_pose(&app->hour_hand, hour_angle);
+    clock_apply_hand_pose(&app->minute_hand, minute_angle);
+    clock_apply_hand_pose(&app->second_hand, second_angle);
+    clock_update_info_label(app);
+
+    app->clock_timer = lv_timer_create(clock_tick_timer_cb, 1000, app);
+}
+
+static void ui_create(app_state_t *app)
+{
+    lv_obj_t *screen = lv_display_get_screen_active(app->display);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    app->face = lv_obj_create(screen);
+    lv_obj_set_size(app->face, APP_DIAL_SIZE, APP_DIAL_SIZE);
+    lv_obj_center(app->face);
+    lv_obj_set_style_radius(app->face, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(app->face, lv_color_hex(0x050607), 0);
+    lv_obj_set_style_bg_opa(app->face, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(app->face, 2, 0);
+    lv_obj_set_style_border_color(app->face, lv_color_hex(0x2C3138), 0);
+    lv_obj_set_style_outline_width(app->face, 1, 0);
+    lv_obj_set_style_outline_color(app->face, lv_color_hex(0x101418), 0);
+    lv_obj_set_style_outline_opa(app->face, LV_OPA_80, 0);
+    lv_obj_set_style_pad_all(app->face, 0, 0);
+    lv_obj_clear_flag(app->face, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *inner_ring = lv_obj_create(app->face);
+    lv_obj_set_size(inner_ring, 176, 176);
+    lv_obj_center(inner_ring);
+    lv_obj_set_style_radius(inner_ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(inner_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(inner_ring, 1, 0);
+    lv_obj_set_style_border_color(inner_ring, lv_color_hex(0x171B20), 0);
+    lv_obj_set_style_outline_width(inner_ring, 0, 0);
+    lv_obj_set_style_pad_all(inner_ring, 0, 0);
+
+    for (uint32_t i = 0; i < APP_TICK_COUNT; i++) {
+        create_tick(app, app->face, i);
+    }
+
+    create_numeral(app->face, &app->numerals[0], "12", 0.0f, -9, -11);
+    create_numeral(app->face, &app->numerals[1], "3", 90.0f, -4, -8);
+    create_numeral(app->face, &app->numerals[2], "6", 180.0f, -4, -6);
+    create_numeral(app->face, &app->numerals[3], "9", 270.0f, -4, -8);
+
+    hand_widget_create(&app->hour_hand, app->face, 52, 0, 6, lv_color_hex(0xB9C0C8), LV_OPA_COVER, 0);
+    hand_widget_create(&app->minute_hand, app->face, 74, 0, 4, lv_color_hex(0xF4F7FA), LV_OPA_COVER, 0);
+    hand_widget_create(&app->second_hand, app->face, 86, 24, 2, lv_color_hex(0xFF453A), LV_OPA_COVER, 8);
+
+    app->center_outer = lv_obj_create(app->face);
+    lv_obj_set_size(app->center_outer, 14, 14);
+    lv_obj_center(app->center_outer);
+    lv_obj_set_style_radius(app->center_outer, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(app->center_outer, lv_color_hex(0xC8CDD4), 0);
+    lv_obj_set_style_bg_opa(app->center_outer, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(app->center_outer, 0, 0);
+
+    app->center_inner = lv_obj_create(app->face);
+    lv_obj_set_size(app->center_inner, 6, 6);
+    lv_obj_center(app->center_inner);
+    lv_obj_set_style_radius(app->center_inner, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(app->center_inner, lv_color_hex(0x101214), 0);
+    lv_obj_set_style_bg_opa(app->center_inner, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(app->center_inner, 0, 0);
+
+    app->info_label = lv_label_create(screen);
+    lv_label_set_text(app->info_label, "SIM  10:08:36");
+    lv_obj_align(app->info_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_text_color(app->info_label, lv_color_hex(0x5E6670), 0);
+    lv_obj_set_style_text_opa(app->info_label, LV_OPA_80, 0);
+    lv_obj_set_style_text_letter_space(app->info_label, 2, 0);
+}
 
 void app_main(void)
 {
     app_state_t *app = &s_app;
     memset(app, 0, sizeof(*app));
-    app->mode = APP_MODE_FLUID;
-    app->theme_index = 0;
-    app->start_time_us = esp_timer_get_time();
 
-    printf("A1\n");
-    fflush(stdout);
-    lcd_display_init(&app->panel);
-    printf("A2\n");
-    fflush(stdout);
-    button_init(&app->button);
-    printf("A3\n");
-    fflush(stdout);
-    motion_input_init(&app->motion);
-    printf("A4\n");
-    fflush(stdout);
+    clock_model_init(&app->clock);
+    lcd_display_init(app);
+    lvgl_init_display(app);
 
-    // 初始化LVGL
-    lvgl_port_cfg_t lvgl_cfg = LVGL_PORT_DEFAULT_CONFIG();
-    ESP_ERROR_CHECK(lvgl_port_init(&lvgl_cfg));
+    _lock_acquire(&s_lvgl_lock);
+    ui_create(app);
+    clock_start(app);
+    _lock_release(&s_lvgl_lock);
 
-    // 添加显示
-    lvgl_port_display_cfg_t disp_cfg = LVGL_PORT_DISPLAY_DEFAULT_CONFIG(app->panel);
-    disp_cfg.buffer_size = APP_LCD_H_RES * APP_LCD_V_RES * sizeof(uint16_t);
-    disp_cfg.double_buffer = true;
-    ESP_ERROR_CHECK(lvgl_port_add_disp(&disp_cfg));
+    xTaskCreate(lvgl_port_task, "lvgl", APP_LVGL_TASK_STACK_SIZE, NULL, APP_LVGL_TASK_PRIORITY, NULL);
 
-    // 创建Canvas用于流体绘制
-    g_canvas_buf = heap_caps_malloc(APP_LCD_H_RES * APP_LCD_V_RES * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    if (g_canvas_buf == NULL) {
-        ESP_LOGE(TAG, "Canvas buffer allocation failed");
-        return;
-    }
-
-    g_canvas = lv_canvas_create(lv_scr_act());
-    lv_canvas_set_buffer(g_canvas, g_canvas_buf, APP_LCD_H_RES, APP_LCD_V_RES, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_size(g_canvas, APP_LCD_H_RES, APP_LCD_V_RES);
-    lv_obj_center(g_canvas);
-
-    // 初始化流体
-    fluid_apply_preset(&app->fluid, 0);
-    printf("A6\n");
-    fflush(stdout);
-
-    // 创建赛博朋克风格的HUD元素
-    lv_obj_t *hud_frame = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(hud_frame, APP_LCD_H_RES - 20, APP_LCD_V_RES - 20);
-    lv_obj_center(hud_frame);
-    lv_obj_set_style_bg_color(hud_frame, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_border_color(hud_frame, lv_color_hex(0x00FFFF), 0);
-    lv_obj_set_style_border_width(hud_frame, 1, 0);
-    lv_obj_set_style_border_opa(hud_frame, 150, 0);
-    lv_obj_set_style_radius(hud_frame, 8, 0);
-    lv_obj_set_style_shadow_color(hud_frame, lv_color_hex(0x00FFFF), 0);
-    lv_obj_set_style_shadow_width(hud_frame, 4, 0);
-    lv_obj_set_style_shadow_opa(hud_frame, 100, 0);
-
-    // 添加G-Sensor数据显示
-    lv_obj_t *sensor_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(sensor_label, "G-Sensor: 0.00, 0.00");
-    lv_obj_set_pos(sensor_label, 10, 10);
-    lv_obj_set_style_text_color(sensor_label, lv_color_hex(0x00FFFF), 0);
-    lv_obj_set_style_bg_color(sensor_label, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(sensor_label, 100, 0);
-
-    int64_t last_frame_us = esp_timer_get_time();
-    ESP_LOGI(TAG, "Project ready: short press toggles color theme, long press pauses/resets fluid");
-
-    while (true) {
-        int64_t frame_begin_us = esp_timer_get_time();
-        float dt = (float)(frame_begin_us - last_frame_us) / 1000000.0f;
-        last_frame_us = frame_begin_us;
-        dt = clampf(dt, 0.010f, 0.040f);
-
-        button_poll(app);
-        motion_update(app, dt);
-
-        // 更新G-Sensor数据显示
-        char sensor_text[32];
-        sprintf(sensor_text, "G-Sensor: %.2f, %.2f", app->tilt_x, app->tilt_y);
-        lv_label_set_text(sensor_label, sensor_text);
-
-        // 流体模拟和绘制
-        if (!g_fluid_paused) {
-            float gx = app->tilt_x * 9.5f;
-            float gy = app->tilt_y * 9.5f + 2.0f;
-            fluid_step(&app->fluid, dt, gx, gy);
-        }
-        
-        // 清除canvas
-        lv_canvas_fill_bg(g_canvas, lv_color_hex(0x000000), LV_OPA_COVER);
-        
-        // 绘制流体粒子
-        const ui_theme_t *theme = current_theme(app);
-        for (int i = 0; i < PARTICLE_COUNT; i++) {
-            const particle_t *p = &app->fluid.particles[i];
-            int sx = 18 + (int)(p->x * 204.0f);
-            int sy = 18 + (int)(p->y * 204.0f);
-            float speed = clampf(sqrtf(p->vx * p->vx + p->vy * p->vy) * 4.0f, 0.0f, 1.0f);
-            
-            // 绘制粒子拖尾
-            for (int j = 1; j <= 3; j++) {
-                float t = (float)j / 3.0f;
-                int tx = sx - (int)(p->vx * t * 10.0f);
-                int ty = sy - (int)(p->vy * t * 10.0f);
-                lv_color_t color = lv_color_hex(speed > 0.72f ? theme->accent : theme->secondary);
-                lv_canvas_draw_circle(g_canvas, tx, ty, PARTICLE_RADIUS_PX - j + 1, color, LV_OPA_50, color);
-            }
-            
-            // 绘制粒子主体
-            lv_color_t color = lv_color_hex(speed > 0.30f ? theme->primary : theme->secondary);
-            lv_canvas_draw_circle(g_canvas, sx, sy, PARTICLE_RADIUS_PX, color, LV_OPA_COVER, color);
-        }
-
-        // 绘制重力方向指示器
-        int cx = APP_LCD_H_RES / 2;
-        int cy = APP_LCD_V_RES / 2;
-        int gx_pos = cx + (int)(app->tilt_x * 44.0f);
-        int gy_pos = cy + (int)(app->tilt_y * 44.0f);
-        lv_canvas_draw_line(g_canvas, cx, cy, gx_pos, gy_pos, lv_color_hex(theme->accent), 2);
-        lv_canvas_draw_circle(g_canvas, gx_pos, gy_pos, 4, lv_color_hex(theme->accent), LV_OPA_COVER, lv_color_hex(theme->accent));
-        lv_canvas_draw_circle(g_canvas, cx, cy, 3, lv_color_hex(theme->primary), LV_OPA_COVER, lv_color_hex(theme->primary));
-
-        // 刷新LVGL显示
-        lv_timer_handler();
-
-        int64_t spent_ms = (esp_timer_get_time() - frame_begin_us) / 1000;
-        if (spent_ms < APP_FRAME_INTERVAL_MS) {
-            vTaskDelay(pdMS_TO_TICKS(APP_FRAME_INTERVAL_MS - spent_ms));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
+    ESP_LOGI(TAG, "Minimal analog clock ready (%s time source)", app->clock.use_system_time ? "system" : "simulated");
 }
