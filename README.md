@@ -41,6 +41,7 @@ idf.py -p COM3 -b 115200 flash
 
 # 如需串口监视，可执行
 idf.py -p COM3 monitor
+```
 ## 设置时间
 项目支持通过串口输入命令来设置系统时间。
 
