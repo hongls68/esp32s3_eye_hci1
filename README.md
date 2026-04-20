@@ -1,141 +1,69 @@
-| Supported Targets | ESP32-P4 | ESP32-S3 |
-| ----------------- | -------- | -------- |
+ESP32-S3-EYE 智能表盘演示
+项目简介
+本项目基于 esp-bsp/examples/display 示例改造而来，旨在为 ESP32-S3-EYE 开发板提供一个功能完善的智能表盘演示。
+当前项目主要实现了表盘模式，用于显示实时时间与系统状态信息。同时，项目架构已为后续的流体模式（根据 IMU 倾斜驱动粒子流动）预留了接口与逻辑框架。
+项目的设计目标是在尽量不破坏原有板级支持包（BSP）结构的前提下，实现一个可直接编译、烧录和运行的基础演示应用。
+当前功能
+● 自定义表盘界面：提供两套不同风格的表盘主题。
+● 主题切换：通过 PLAY 键切换表盘主题。
+● 模式切换框架：通过 MENU 键预留了表盘模式与流体模式的切换接口。
+● IMU 自动探测：支持自动识别板载的 QMA6100P、BMI270 或 ICM42670 传感器。
+● 串口时间设置：支持通过串口命令设置系统时间。
+硬件与环境
+● 芯片：ESP32-S3
+● 开发板：ESP32-S3-EYE
+● SDK：esp-idf v5.4
+● 图形库：LVGL
+按键说明
+按键
+功能
+MENU
+预留：切换表盘模式 / 流体模式
+PLAY
+切换表盘主题
+PLAY (长按)
+预留：重置流体粒子
+UP
+预留：在流体模式下，将重力方向旋转 +10°
+DOWN
+预留：在流体模式下，将重力方向旋转 -10°
 
 
-# DVP Camera display via LCD example
+构建与烧录
+在 examples/display 项目目录下，执行以下命令进行构建和烧录：
+代码
+图标/24_new/复制
 
-## Overview
+# 构建项目
+idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.bsp.esp32_s3_eye build
 
-This example demonstrates how to use the esp_driver_cam component to capture DVP camera sensor signals and display it via LCD interface. This example will auto-detect camera sensors via [ESP camera sensor driver](https://components.espressif.com/components/espressif/esp_cam_sensor) and capture camera sensor signals via DVP interface and display it via LCD interface.
+# 烧录到开发板 (请将 COM3 替换为你的实际端口)
+idf.py -p COM3 -b 115200 flash
 
-## Usage
+# 如需串口监视，可执行
+idf.py -p COM3 monitor
 
-The subsections below give only absolutely necessary information. For full steps to configure ESP-IDF and use it to build and run projects, see [ESP-IDF Getting Started](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html#get-started).
-
-
-### Hardware Required
-
-- ESP32S3 devkit with OV2640 camera sensor and ST7789 LCD screen
-- or an ESP32S3-EYE dev-kit
-
-You can also connect camera sensors and LCD screens from other vendors to the ESP chip, you can find corresponding camera or LCD drivers from [ESP Component Registry](https://components.espressif.com), or design your own customized drivers.
-
-
-                                   GND                                                                   GND
-                ┌────────────────────────────────────────────────┐             ┌─────────────────────────────────────────────────────────┐
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                                │             │                                                         │
-                │                                ┌───────────────┴─────────────┴──────────────────┐                                      │
-                │                                │                                                │                           ┌──────────┴───────────┐
-                │                                │                                                │      LCD MOSI             │                      │
-                │                                │                                                ├───────────────────────────┤                      │
-    ┌───────────┴─────────┐                      │                                                │                           │                      │
-    │                     │                      │                                                │      LCD CLK              │                      │
-    │                     │                      │                                                ├───────────────────────────┤                      │
-    │                     │       XCLK           │                  ESP_CHIP                      │                           │                      │
-    │     DVP Camera      ├──────────────────────┤                                                │      LCD CS               │      LCD Screen      │
-    │                     │                      │                                                ├───────────────────────────┤                      │
-    │                     │       D0~7           │                                                │                           │                      │
-    │                     ├──────────────────────┤                                                │      LCD DC               │                      │
-    │                     │                      │                                                ├───────────────────────────┤                      │
-    │                     │       PCLK           │                                                │                           │                      │
-    │                     ├──────────────────────┤                                                │      LCD BACKLIGHT        │                      │
-    │                     │                      │                                                ├───────────────────────────┤                      │
-    │                     │       VSYNC          │                                                │                           │                      │
-    │                     ├──────────────────────┤                                                │                           │                      │
-    │                     │                      │                                                │                           │                      │
-    │                     │      DE (HREF)       │                                                │                           │                      │
-    │                     ├──────────────────────┤                                                │                           └──────────────────────┘
-    │                     │                      │                                                │
-    └───────┬──┬──────────┘                      │                                                │
-            │  │           I2C SCL               │                                                │
-            │  └─────────────────────────────────┤                                                │
-            │              I2C SDA               │                                                │
-            └────────────────────────────────────┤                                                │
-                                                 └────────────────────────────────────────────────┘
-
-
-### Set Chip Target
-
-First of all, your target must be supported by both:
-
-- **By your ESP-IDF version**: For the full list of supported targets, run:
-  ```
-  idf.py --list-targets
-  ```
-- **By this example**: For the full list of supported targets,  refer to the supported targets table at the top of this README.
-
-After you make sure that your target is supported, go to your example project directory and [set the chip target](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/tools/idf-py.html#select-the-target-chip-set-target):
-
-```
-idf.py set-target <target>
-```
-
-For example, to set esp32-S3 as the chip target, run:
-
-```
-idf.py set-target esp32s3
-```
-
-
-### Configure the Project
-
-For information about Kconfig options, see [Project Configuration](https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/kconfig.html) > _Name of relevant section(s)_.
-
-To conveniently check or modify Kconfig options for this example in a project configuration menu, run:
-
-```
-idf.py menuconfig
-```
-
-```
-Set CONFIG_CAMERA_OV2640 to y
-```
-
-Available options for the camera sensor output horizontal/vertical resolution can be seen in ``menuconfig`` > ``Example Configuration``.
-
-
-### Build and Flash
-
-Execute the following command to build the project, flash it to your development board, and run the monitor tool to view the serial output:
-
-```
-idf.py build flash monitor
-```
-
-This command can be reduced to `idf.py flash monitor`.
-
-If the above command fails, check the log on the serial monitor which usually provides information on the possible cause of the issue.
-
-To exit the serial monitor, use `Ctrl` + `]`.
-
-
-## Example Output
-
-If you see the following console output, your example should be running correctly:
-
-```
-I (1481) main_task: Calling app_main()
-I (278) dvp_spi_lcd: Init SPI bus
-I (278) dvp_spi_lcd: New panel IO SPI
-I (278) dvp_spi_lcd: New ST7789 panel
-I (278) dvp_spi_lcd: Reset and init panel
-I (408) dvp_spi_lcd: Turn on display
-I (408) dvp_spi_lcd: Screen lit up now!
-
-```
-
-
-## Reference
-
-- Link to the ESP-IDF feature's API reference, for example [ESP-IDF: Camera Controller Driver](https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/peripherals/camera_driver.html)
-- [ESP-IDF Getting Started](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html#get-started)
-- [Project Configuration](https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/kconfig.html) (Kconfig Options)
-docs
-docs
+设置时间
+项目支持通过串口输入命令来设置系统时间。
+命令格式：
+date MMDDHHMMYYYY
+示例：
+输入 date 040217302026 可将时间设置为 2026年4月2日 17:30。
+主要文件
+● main/main.c：应用程序入口。
+● main/watch_face.c：包含表盘逻辑、按键处理及 IMU 初始化的核心代码。
+● main/watch_face.h：应用入口声明。
+● main/watch_zh_patch_font.c：中文字体补丁。
+● sdkconfig.bsp.esp32_s3_eye：针对 ESP32-S3-EYE 开发板的默认配置。
+当前状态
+当前仓库中的版本是一个稳定的基线版本：
+● 项目可以成功编译。
+● 可以顺利烧录至 ESP32-S3-EYE 开发板。
+● 表盘模式已验证可正常运行，时间显示准确。
+● IMU 驱动已集成，可自动识别传感器。
+● 代码已通过 Git 提交保存。
+未来演进方向
+后续计划在此基础上实现流体演示功能：
+● 轻量粒子流体方案：用一组二维粒子表征液体，根据 IMU 数据计算重力向量驱动流动。
+● 物理模拟：对粒子施加重力、阻尼，并实现边界反弹与简单的粒子碰撞修正。
+● 渲染优化：基于 LVGL Canvas 实现高效的流体效果绘制。
