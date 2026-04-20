@@ -138,3 +138,4 @@ I (408) dvp_spi_lcd: Screen lit up now!
 - [ESP-IDF Getting Started](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html#get-started)
 - [Project Configuration](https://docs.espressif.com/projects/esp-idf/en/latest/api-reference/kconfig.html) (Kconfig Options)
 docs
+docs
